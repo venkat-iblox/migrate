@@ -270,11 +270,26 @@ Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoU
         }
         handleDirty := viper.GetBool("dirty")
         destPath := viper.GetString("intermediate-path")
+        srcPath := ""
+        // if sourcePtr is set, use it to get the source path
+        // otherwise, use the path flag
+        if path != "" {
+            srcPath = path
+        }
+        if sourcePtr != "" {
+            // parse the source path from the source argument
+            parse, err := url.Parse(sourcePtr)
+            if err != nil {
+                log.fatal("error: can't parse the source path from the source argument")
+            }
+            srcPath = parse.Path
+        }
 
         if handleDirty && destPath == "" {
             log.fatal("error: intermediate-path must be specified when dirty is set")
         }
-        migrater.WithDirtyStateHandler(path, destPath, handleDirty)
+        log.Printf("running goto with handleDirty: %t, destPath: %s, srcPath: %s\n", handleDirty, destPath, srcPath)
+        migrater.WithDirtyStateHandler(srcPath, destPath, handleDirty)
         if err = gotoCmd(migrater, uint(v)); err != nil {
             log.fatalErr(err)
         }

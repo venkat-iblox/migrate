@@ -126,6 +126,8 @@ func (m *Migrate) CopyFiles() error {
         return err
     }
 
+    m.Log.Printf("Copying files from %s to %s", m.ds.srcPath, m.ds.destPath)
+
     return filepath.Walk(m.ds.srcPath, func(src string, info os.FileInfo, err error) error {
         if err != nil {
             return err
@@ -133,8 +135,19 @@ func (m *Migrate) CopyFiles() error {
 
         // ignore sub-directories in the migration directory
         if info.IsDir() {
+            // Skip the tests directory and its files
+            if info.Name() == "tests" {
+                m.Log.Printf("Ignoring directory %s", info.Name())
+                return filepath.SkipDir
+            }
             return nil
         }
+        // Ignore the current.sql file
+        if info.Name() == "current.sql" {
+            m.Log.Printf("Ignoring file %s", info.Name())
+            return nil
+        }
+
         var (
             srcFile  *os.File
             destFile *os.File

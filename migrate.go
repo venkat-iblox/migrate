@@ -123,6 +123,15 @@ func New(sourceURL, databaseURL string) (*Migrate, error) {
     return m, nil
 }
 
+func (m *Migrate) updateSourceDrv(sourceURL string) error {
+    sourceDrv, err := source.Open(sourceURL)
+    if err != nil {
+        return fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
+    }
+    m.sourceDrv = sourceDrv
+    return nil
+}
+
 // NewWithDatabaseInstance returns a new Migrate instance from a source URL
 // and an existing database instance. The source URL scheme is defined by each driver.
 // Use any string that can serve as an identifier during logging as databaseName.
@@ -231,27 +240,35 @@ func (m *Migrate) Close() (source error, database error) {
 func (m *Migrate) Migrate(version uint) error {
     curVersion, dirty, err := m.databaseDrv.Version()
     if err != nil {
+        m.Log.Printf("******************Failed to get current version: %v\n", err)
         return err
     }
+
     if err = m.CopyFiles(); err != nil {
         return err
     }
+
+    m.Log.Printf("Current version: %d, dirty: %t\n", curVersion, dirty)
     // if the dirty flag is passed to the 'goto' command, handle the dirty state
-    if m.ds.isDirty && dirty {
-        m.Log.Printf("Version: %d, handle dirty: %t\n", version, m.ds.isDirty)
-        if err = m.HandleDirtyState(); err != nil {
-            return err
+    if dirty {
+        if m.ds.isDirty {
+            m.Log.Printf("Version: %d, handle dirty: %t\n", version, m.ds.isDirty)
+            if err = m.HandleDirtyState(); err != nil {
+                return err
+            }
+            if err = m.updateSourceDrv(fmt.Sprintf("file://%s", m.ds.destPath)); err != nil {
+                return err
+            }
+
+        } else {
+            // default behaviour
+            m.Log.Printf("Database is set to dirty for version: %v\n", curVersion)
+            return ErrDirty{curVersion}
         }
     }
 
     if err = m.lock(); err != nil {
         return err
-    }
-
-    if dirty {
-        // default behaviour
-        m.Log.Printf("Database is set to dirty for version: %v\n", curVersion)
-        return m.unlockErr(ErrDirty{curVersion})
     }
 
     ret := make(chan interface{}, m.PrefetchMigrations)
@@ -766,6 +783,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 // to stop execution because it might have received a stop signal on the
 // GracefulStop channel.
 func (m *Migrate) runMigrations(ret <-chan interface{}) error {
+    m.Log.Printf("Starting %s migrations\n", m.sourceDrv)
     for r := range ret {
 
         if m.stop() {
