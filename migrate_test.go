@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1413,4 +1416,322 @@ func equalDbSeq(t *testing.T, i int, expected migrationSequence, got *dStub.Stub
 	if !got.EqualSequence(bs) {
 		t.Fatalf("\nexpected sequence %v,\ngot               %v, in %v", bs, got.MigrationSequence, i)
 	}
+}
+
+// Setting up temp directory to be used as a PVC mount
+func setupTempDir(t *testing.T) (string, func()) {
+	tempDir, err := os.MkdirTemp("", "migrate_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tempDir, func() {
+		if err = os.RemoveAll(tempDir); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func setupMigrateInstance(tempDir string) (*Migrate, *dStub.Stub) {
+	m, _ := New("stub://", "stub://")
+	m.ds = &dirtyStateHandler{
+		destPath: tempDir,
+		isDirty:  true,
+	}
+	return m, m.databaseDrv.(*dStub.Stub)
+}
+
+func setupSourceStubMigrations() *source.Migrations {
+	migrations := source.NewMigrations()
+	migrations.Append(&source.Migration{Version: 1, Direction: source.Up, Identifier: "CREATE 1"})
+	migrations.Append(&source.Migration{Version: 1, Direction: source.Down, Identifier: "DROP 1"})
+	migrations.Append(&source.Migration{Version: 2, Direction: source.Up, Identifier: "CREATE 2"})
+	migrations.Append(&source.Migration{Version: 2, Direction: source.Down, Identifier: "DROP 2"})
+	migrations.Append(&source.Migration{Version: 3, Direction: source.Up, Identifier: "CREATE 3"})
+	migrations.Append(&source.Migration{Version: 3, Direction: source.Down, Identifier: "DROP 3"})
+	migrations.Append(&source.Migration{Version: 4, Direction: source.Up, Identifier: "CREATE 4"})
+	migrations.Append(&source.Migration{Version: 4, Direction: source.Down, Identifier: "DROP 4"})
+	migrations.Append(&source.Migration{Version: 5, Direction: source.Up, Identifier: "CREATE 5"})
+	migrations.Append(&source.Migration{Version: 5, Direction: source.Down, Identifier: "DROP 5"})
+	migrations.Append(&source.Migration{Version: 6, Direction: source.Up, Identifier: "CREATE 6"})
+	migrations.Append(&source.Migration{Version: 6, Direction: source.Down, Identifier: "DROP 6"})
+	migrations.Append(&source.Migration{Version: 7, Direction: source.Up, Identifier: "CREATE 7"})
+	migrations.Append(&source.Migration{Version: 7, Direction: source.Down, Identifier: "DROP 7"})
+	return migrations
+}
+
+func TestHandleDirtyState(t *testing.T) {
+	tempDir, cleanup := setupTempDir(t)
+	defer cleanup()
+
+	m, dbDrv := setupMigrateInstance(tempDir)
+	m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
+
+	tests := []struct {
+		lastSuccessful int
+		currentVersion int
+		err            error
+		setupFailure   bool
+	}{
+		{lastSuccessful: 1, currentVersion: 2, err: nil, setupFailure: false},
+		{lastSuccessful: 4, currentVersion: 5, err: nil, setupFailure: false},
+		{lastSuccessful: 3, currentVersion: 4, err: nil, setupFailure: false},
+		{lastSuccessful: -3, currentVersion: 4, err: ErrInvalidVersion, setupFailure: false},
+		{lastSuccessful: 4, currentVersion: 3, err: fmt.Errorf("open %s: no such file or directory", filepath.Join(tempDir, lastSuccessfulMigrationFile)), setupFailure: true},
+	}
+
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			var lastSuccessfulMigrationPath string
+			// setupFailure tests scenario where the 'lastSuccessfulMigrationFile' doesn't exist
+			if !test.setupFailure {
+				lastSuccessfulMigrationPath = filepath.Join(tempDir, lastSuccessfulMigrationFile)
+				if err := os.WriteFile(lastSuccessfulMigrationPath, []byte(strconv.Itoa(test.lastSuccessful)), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Setting the DB version as dirty
+			if err := dbDrv.SetVersion(test.currentVersion, true); err != nil {
+				t.Fatal(err)
+			}
+
+			// Quick check to see if set correctly
+			version, b, err := dbDrv.Version()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if version != test.currentVersion {
+				t.Fatalf("expected version %d, got %d", test.currentVersion, version)
+			}
+
+			if !b {
+				t.Fatalf("expected false, got true")
+			}
+
+			// Handle dirty state
+			if err = m.HandleDirtyState(); err != nil {
+				if strings.Contains(err.Error(), test.err.Error()) {
+					t.Logf("expected error %v, got %v", test.err, err)
+					if !test.setupFailure {
+						if err = os.Remove(lastSuccessfulMigrationPath); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return
+				} else {
+					t.Fatal(err)
+				}
+			}
+			// Check 1: DB should no longer be dirty
+			if dbDrv.IsDirty {
+				t.Fatalf("expected dirty to be false, got true")
+			}
+			// Check 2: Current version should be the last successful version
+			if dbDrv.CurrentVersion != test.lastSuccessful {
+				t.Fatalf("expected version %d, got %d", test.lastSuccessful, dbDrv.CurrentVersion)
+			}
+			// Check 3: The lastSuccessfulMigration file shouldn't exists
+			if _, err = os.Stat(lastSuccessfulMigrationPath); !os.IsNotExist(err) {
+				t.Fatalf("expected file to be deleted, but it still exists")
+			}
+		})
+	}
+}
+
+func TestHandleMigrationFailure(t *testing.T) {
+	tempDir, cleanup := setupTempDir(t)
+	defer cleanup()
+
+	m, dbDrv := setupMigrateInstance(tempDir)
+	m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
+
+	tests := []struct {
+		curVersion    int
+		targetVersion uint
+		dirtyVersion  int
+	}{
+		{curVersion: 1, targetVersion: 7, dirtyVersion: 4},
+		{curVersion: 4, targetVersion: 6, dirtyVersion: 5},
+		{curVersion: 3, targetVersion: 7, dirtyVersion: 6},
+	}
+
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			t.Cleanup(func() {
+				m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
+				dbDrv = m.databaseDrv.(*dStub.Stub)
+			})
+
+			// Setup: Simulate a migration failure by setting the dirty version in the DB
+			if err := dbDrv.SetVersion(test.dirtyVersion, true); err != nil {
+				t.Fatal(err)
+			}
+
+			// Test
+			if err := m.HandleMigrationFailure(test.curVersion, test.targetVersion); err != nil {
+				t.Fatal(err)
+			}
+
+			// Check 1: Should no longer be dirty
+			if !dbDrv.IsDirty {
+				t.Fatalf("expected dirty to be true, got false")
+			}
+
+			// Check 2: last successful Migration version should be stored in a file
+			lastSuccessfulMigrationPath := filepath.Join(tempDir, lastSuccessfulMigrationFile)
+			if _, err := os.Stat(lastSuccessfulMigrationPath); os.IsNotExist(err) {
+				t.Fatalf("expected file to be created, but it does not exist")
+			}
+
+			// Check 3: Check if the content of last successful migration has the correct version
+			content, err := os.ReadFile(lastSuccessfulMigrationPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if string(content) != strconv.Itoa(test.dirtyVersion-1) {
+				t.Fatalf("expected %d, got %s", test.dirtyVersion-1, string(content))
+			}
+		})
+	}
+}
+
+func TestCleanupFiles(t *testing.T) {
+	tempDir, cleanup := setupTempDir(t)
+	defer cleanup()
+
+	m, _ := setupMigrateInstance(tempDir)
+
+	tests := []struct {
+		migrationFiles []string
+		targetVersion  uint
+		remainingFiles []string
+		emptyDestPath  bool
+	}{
+		{
+			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+			targetVersion:  2,
+			remainingFiles: []string{"1_up.sql", "2_up.sql"},
+		},
+		{
+			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql", "5_up.sql"},
+			targetVersion:  3,
+			remainingFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+		},
+		{
+			migrationFiles: []string{},
+			targetVersion:  1,
+			remainingFiles: []string{},
+			emptyDestPath:  true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			for _, file := range test.migrationFiles {
+				if err := os.WriteFile(filepath.Join(tempDir, file), []byte(""), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if test.emptyDestPath {
+				m.ds.destPath = ""
+			}
+
+			if err := m.CleanupFiles(test.targetVersion); err != nil {
+				t.Fatal(err)
+			}
+
+			// check 1: only files upto the target version should exist
+			for _, file := range test.remainingFiles {
+				if _, err := os.Stat(filepath.Join(tempDir, file)); os.IsNotExist(err) {
+					t.Fatalf("expected file %s to exist, but it does not", file)
+				}
+			}
+
+			// check 2: the files removed are as expected
+			deletedFiles := diff(test.migrationFiles, test.remainingFiles)
+			for _, deletedFile := range deletedFiles {
+				if _, err := os.Stat(filepath.Join(tempDir, deletedFile)); !os.IsNotExist(err) {
+					t.Fatalf("expected file %s to be deleted, but it still exists", deletedFile)
+				}
+			}
+		})
+	}
+}
+
+func TestCopyFiles(t *testing.T) {
+	srcDir, cleanupSrc := setupTempDir(t)
+	defer cleanupSrc()
+
+	destDir, cleanupDest := setupTempDir(t)
+	defer cleanupDest()
+
+	m, _ := New("stub://", "stub://")
+	m.ds = &dirtyStateHandler{
+		srcPath:  srcDir,
+		destPath: destDir,
+	}
+
+	tests := []struct {
+		migrationFiles []string
+		copiedFiles    []string
+		emptyDestPath  bool
+	}{
+		{
+			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+			copiedFiles:    []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+		},
+		{
+			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql", "current.sql"},
+			copiedFiles:    []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql"},
+		},
+		{
+			emptyDestPath: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run("", func(t *testing.T) {
+			for _, file := range test.migrationFiles {
+				if err := os.WriteFile(filepath.Join(srcDir, file), []byte(""), 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.emptyDestPath {
+				m.ds.destPath = ""
+			}
+
+			if err := m.CopyFiles(); err != nil {
+				t.Fatal(err)
+			}
+
+			for _, file := range test.copiedFiles {
+				if _, err := os.Stat(filepath.Join(destDir, file)); os.IsNotExist(err) {
+					t.Fatalf("expected file %s to be copied, but it does not exist", file)
+				}
+			}
+		})
+	}
+}
+
+/*
+   diff returns an array containing the elements in Array A and not in B
+*/
+
+func diff(a, b []string) []string {
+	temp := map[string]int{}
+	for _, s := range a {
+		temp[s]++
+	}
+	for _, s := range b {
+		temp[s]--
+	}
+
+	var result []string
+	for s, v := range temp {
+		if v != 0 {
+			result = append(result, s)
+		}
+	}
+	return result
 }

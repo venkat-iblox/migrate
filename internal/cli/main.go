@@ -1,103 +1,96 @@
 package cli
 
 import (
-    "database/sql"
-    "fmt"
-    "net/url"
-    "os"
-    "os/signal"
-    "strconv"
-    "strings"
-    "syscall"
-    "time"
+	"database/sql"
+	"fmt"
+	"net/url"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
-    flag "github.com/spf13/pflag"
-    "github.com/spf13/viper"
+	flag "github.com/spf13/pflag"
+	"github.com/spf13/viper"
 
-    "github.com/golang-migrate/migrate/v4"
-    "github.com/golang-migrate/migrate/v4/database"
-    "github.com/golang-migrate/migrate/v4/database/postgres"
-    "github.com/golang-migrate/migrate/v4/source"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source"
 )
 
 const (
-    defaultTimeFormat = "20060102150405"
-    defaultTimezone   = "UTC"
-    createUsage       = `create [-ext E] [-dir D] [-seq] [-digits N] [-format] [-tz] NAME
+	defaultTimeFormat = "20060102150405"
+	defaultTimezone   = "UTC"
+	createUsage       = `create [-ext E] [-dir D] [-seq] [-digits N] [-format] [-tz] NAME
 	   Create a set of timestamped up/down migrations titled NAME, in directory D with extension E.
 	   Use -seq option to generate sequential up/down migrations with N digits.
 	   Use -format option to specify a Go time format string. Note: migrations with the same time cause "duplicate migration version" error.
            Use -tz option to specify the timezone that will be used when generating non-sequential migrations (defaults: UTC).
 `
-    gotoUsage = `goto V [-dirty]      Migrate to version V`
-    upUsage   = `up [N]       Apply all or N up migrations`
-    downUsage = `down [N] [-all]    Apply all or N down migrations
+	gotoUsage = `goto V [-dirty] [-intermediate-path]     Migrate to version V`
+	upUsage   = `up [N]       Apply all or N up migrations`
+	downUsage = `down [N] [-all]    Apply all or N down migrations
 	Use -all to apply all down migrations`
-    dropUsage = `drop [-f]    Drop everything inside database
+	dropUsage = `drop [-f]    Drop everything inside database
 	Use -f to bypass confirmation`
-    forceUsage = `force V      Set version V but don't run migration (ignores dirty state)`
+	forceUsage = `force V      Set version V but don't run migration (ignores dirty state)`
 )
 
 func handleSubCmdHelp(help bool, usage string, flagSet *flag.FlagSet) {
-    if help {
-        fmt.Fprintln(os.Stderr, usage)
-        flagSet.PrintDefaults()
-        os.Exit(0)
-    }
+	if help {
+		fmt.Fprintln(os.Stderr, usage)
+		flagSet.PrintDefaults()
+		os.Exit(0)
+	}
 }
 
 func newFlagSetWithHelp(name string) (*flag.FlagSet, *bool) {
-    flagSet := flag.NewFlagSet(name, flag.ExitOnError)
-    helpPtr := flagSet.Bool("help", false, "Print help information")
-    return flagSet, helpPtr
-}
-
-func newGoToFlagSetWithHelp(name string) (*flag.FlagSet, *bool) {
-    flagSet := flag.NewFlagSet(name, flag.ExitOnError)
-    flagSet.Bool("dirty", false, "Migration in dirty state")
-    helpPtr := flagSet.Bool("help", false, "Print help information")
-    return flagSet, helpPtr
+	flagSet := flag.NewFlagSet(name, flag.ExitOnError)
+	helpPtr := flagSet.Bool("help", false, "Print help information")
+	return flagSet, helpPtr
 }
 
 // set main log
 var log = &Log{}
 
 func printUsageAndExit() {
-    flag.Usage()
+	flag.Usage()
 
-    // If a command is not found we exit with a status 2 to match the behavior
-    // of flag.Parse() with flag.ExitOnError when parsing an invalid flag.
-    os.Exit(2)
+	// If a command is not found we exit with a status 2 to match the behavior
+	// of flag.Parse() with flag.ExitOnError when parsing an invalid flag.
+	os.Exit(2)
 }
 
 func dbMakeConnectionString(driver, user, password, address, name, ssl string) string {
-    return fmt.Sprintf("%s://%s:%s@%s/%s?sslmode=%s",
-        driver, url.QueryEscape(user), url.QueryEscape(password), address, name, ssl,
-    )
+	return fmt.Sprintf("%s://%s:%s@%s/%s?sslmode=%s",
+		driver, url.QueryEscape(user), url.QueryEscape(password), address, name, ssl,
+	)
 }
 
 // Main function of a cli application. It is public for backwards compatibility with `cli` package
 func Main(version string) {
-    help := viper.GetBool("help")
-    version = viper.GetString("version")
-    verbose := viper.GetBool("verbose")
-    prefetch := viper.GetInt("prefetch")
-    lockTimeout := viper.GetInt("lock-timeout")
-    path := viper.GetString("path")
-    sourcePtr := viper.GetString("source")
+	help := viper.GetBool("help")
+	version = viper.GetString("version")
+	verbose := viper.GetBool("verbose")
+	prefetch := viper.GetInt("prefetch")
+	lockTimeout := viper.GetInt("lock-timeout")
+	path := viper.GetString("path")
+	sourcePtr := viper.GetString("source")
 
-    databasePtr := viper.GetString("database.dsn")
-    if databasePtr == "" {
-        databasePtr = dbMakeConnectionString(
-            viper.GetString("database.driver"), viper.GetString("database.user"),
-            viper.GetString("database.password"), viper.GetString("database.address"),
-            viper.GetString("database.name"), viper.GetString("database.ssl"),
-        )
-    }
+	databasePtr := viper.GetString("database.dsn")
+	if databasePtr == "" {
+		databasePtr = dbMakeConnectionString(
+			viper.GetString("database.driver"), viper.GetString("database.user"),
+			viper.GetString("database.password"), viper.GetString("database.address"),
+			viper.GetString("database.name"), viper.GetString("database.ssl"),
+		)
+	}
 
-    flag.Usage = func() {
-        fmt.Fprintf(os.Stderr,
-            `Usage: migrate OPTIONS COMMAND [arg...]
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr,
+			`Usage: migrate OPTIONS COMMAND [arg...]
        migrate [ -version | -help ]
 
 Options:
@@ -132,323 +125,322 @@ Commands:
 
 Source drivers: `+strings.Join(source.List(), ", ")+`
 Database drivers: `+strings.Join(database.List(), ", ")+"\n", createUsage, gotoUsage, upUsage, downUsage, dropUsage, forceUsage)
-    }
+	}
 
-    // initialize logger
-    log.verbose = verbose
+	// initialize logger
+	log.verbose = verbose
 
-    // show cli version
-    if version == "" {
-        fmt.Fprintln(os.Stderr, version)
-        os.Exit(0)
-    }
+	// show cli version
+	if version == "" {
+		fmt.Fprintln(os.Stderr, version)
+		os.Exit(0)
+	}
 
-    // show help
-    if help {
-        flag.Usage()
-        os.Exit(0)
-    }
+	// show help
+	if help {
+		flag.Usage()
+		os.Exit(0)
+	}
 
-    // translate -path into -source if given
-    if sourcePtr == "" && path != "" {
-        sourcePtr = fmt.Sprintf("file://%v", path)
-    }
+	// translate -path into -source if given
+	if sourcePtr == "" && path != "" {
+		sourcePtr = fmt.Sprintf("file://%v", path)
+	}
 
-    // initialize migrate
-    // don't catch migraterErr here and let each command decide
-    // how it wants to handle the error
-    var migrater *migrate.Migrate
-    var migraterErr error
+	// initialize migrate
+	// don't catch migraterErr here and let each command decide
+	// how it wants to handle the error
+	var migrater *migrate.Migrate
+	var migraterErr error
 
-    if driver := viper.GetString("database.driver"); driver == "hotload" {
-        db, err := sql.Open(driver, databasePtr)
-        if err != nil {
-            log.fatalErr(fmt.Errorf("could not open hotload dsn %s: %s", databasePtr, err))
-        }
-        var dbname, user string
-        if err := db.QueryRow("SELECT current_database(), user").Scan(&dbname, &user); err != nil {
-            log.fatalErr(fmt.Errorf("could not get current_database: %s", err.Error()))
-        }
-        // dbname is not needed since it gets filled in by the driver but we want to be complete
-        migrateDriver, err := postgres.WithInstance(db, &postgres.Config{DatabaseName: dbname})
-        if err != nil {
-            log.fatalErr(fmt.Errorf("could not create migrate driver: %s", err))
-        }
-        migrater, migraterErr = migrate.NewWithDatabaseInstance(sourcePtr, dbname, migrateDriver)
-    } else {
-        migrater, migraterErr = migrate.New(sourcePtr, databasePtr)
-    }
-    defer func() {
-        if migraterErr == nil {
-            if _, err := migrater.Close(); err != nil {
-                log.Println(err)
-            }
-        }
-    }()
-    if migraterErr == nil {
-        migrater.Log = log
-        migrater.PrefetchMigrations = uint(prefetch)
-        migrater.LockTimeout = time.Duration(int64(lockTimeout)) * time.Second
+	if driver := viper.GetString("database.driver"); driver == "hotload" {
+		db, err := sql.Open(driver, databasePtr)
+		if err != nil {
+			log.fatalErr(fmt.Errorf("could not open hotload dsn %s: %s", databasePtr, err))
+		}
+		var dbname, user string
+		if err := db.QueryRow("SELECT current_database(), user").Scan(&dbname, &user); err != nil {
+			log.fatalErr(fmt.Errorf("could not get current_database: %s", err.Error()))
+		}
+		// dbname is not needed since it gets filled in by the driver but we want to be complete
+		migrateDriver, err := postgres.WithInstance(db, &postgres.Config{DatabaseName: dbname})
+		if err != nil {
+			log.fatalErr(fmt.Errorf("could not create migrate driver: %s", err))
+		}
+		migrater, migraterErr = migrate.NewWithDatabaseInstance(sourcePtr, dbname, migrateDriver)
+	} else {
+		migrater, migraterErr = migrate.New(sourcePtr, databasePtr)
+	}
+	defer func() {
+		if migraterErr == nil {
+			if _, err := migrater.Close(); err != nil {
+				log.Println(err)
+			}
+		}
+	}()
+	if migraterErr == nil {
+		migrater.Log = log
+		migrater.PrefetchMigrations = uint(prefetch)
+		migrater.LockTimeout = time.Duration(int64(lockTimeout)) * time.Second
 
-        // handle Ctrl+c
-        signals := make(chan os.Signal, 1)
-        signal.Notify(signals, syscall.SIGINT)
-        go func() {
-            for range signals {
-                log.Println("Stopping after this running migration ...")
-                migrater.GracefulStop <- true
-                return
-            }
-        }()
-    }
+		// handle Ctrl+c
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, syscall.SIGINT)
+		go func() {
+			for range signals {
+				log.Println("Stopping after this running migration ...")
+				migrater.GracefulStop <- true
+				return
+			}
+		}()
+	}
 
-    startTime := time.Now()
+	startTime := time.Now()
 
-    if len(flag.Args()) < 1 {
-        printUsageAndExit()
-    }
-    args := flag.Args()[1:]
+	if len(flag.Args()) < 1 {
+		printUsageAndExit()
+	}
+	args := flag.Args()[1:]
 
-    switch flag.Arg(0) {
-    case "create":
+	switch flag.Arg(0) {
+	case "create":
 
-        seq := false
-        seqDigits := 6
+		seq := false
+		seqDigits := 6
 
-        createFlagSet, help := newFlagSetWithHelp("create")
-        extPtr := createFlagSet.String("ext", "", "File extension")
-        dirPtr := createFlagSet.String("dir", "", "Directory to place file in (default: current working directory)")
-        formatPtr := createFlagSet.String("format", defaultTimeFormat, `The Go time format string to use. If the string "unix" or "unixNano" is specified, then the seconds or nanoseconds since January 1, 1970 UTC respectively will be used. Caution, due to the behavior of time.Time.Format(), invalid format strings will not error`)
-        timezoneName := createFlagSet.String("tz", defaultTimezone, `The timezone that will be used for generating timestamps (default: utc)`)
-        createFlagSet.BoolVar(&seq, "seq", seq, "Use sequential numbers instead of timestamps (default: false)")
-        createFlagSet.IntVar(&seqDigits, "digits", seqDigits, "The number of digits to use in sequences (default: 6)")
+		createFlagSet, help := newFlagSetWithHelp("create")
+		extPtr := createFlagSet.String("ext", "", "File extension")
+		dirPtr := createFlagSet.String("dir", "", "Directory to place file in (default: current working directory)")
+		formatPtr := createFlagSet.String("format", defaultTimeFormat, `The Go time format string to use. If the string "unix" or "unixNano" is specified, then the seconds or nanoseconds since January 1, 1970 UTC respectively will be used. Caution, due to the behavior of time.Time.Format(), invalid format strings will not error`)
+		timezoneName := createFlagSet.String("tz", defaultTimezone, `The timezone that will be used for generating timestamps (default: utc)`)
+		createFlagSet.BoolVar(&seq, "seq", seq, "Use sequential numbers instead of timestamps (default: false)")
+		createFlagSet.IntVar(&seqDigits, "digits", seqDigits, "The number of digits to use in sequences (default: 6)")
 
-        if err := createFlagSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
+		if err := createFlagSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        handleSubCmdHelp(*help, createUsage, createFlagSet)
+		handleSubCmdHelp(*help, createUsage, createFlagSet)
 
-        if createFlagSet.NArg() == 0 {
-            log.fatal("error: please specify name")
-        }
-        name := createFlagSet.Arg(0)
+		if createFlagSet.NArg() == 0 {
+			log.fatal("error: please specify name")
+		}
+		name := createFlagSet.Arg(0)
 
-        if *extPtr == "" {
-            log.fatal("error: -ext flag must be specified")
-        }
+		if *extPtr == "" {
+			log.fatal("error: -ext flag must be specified")
+		}
 
-        timezone, err := time.LoadLocation(*timezoneName)
-        if err != nil {
-            log.fatal(err)
-        }
+		timezone, err := time.LoadLocation(*timezoneName)
+		if err != nil {
+			log.fatal(err)
+		}
 
-        if err := createCmd(*dirPtr, startTime.In(timezone), *formatPtr, name, *extPtr, seq, seqDigits, true); err != nil {
-            log.fatalErr(err)
-        }
+		if err := createCmd(*dirPtr, startTime.In(timezone), *formatPtr, name, *extPtr, seq, seqDigits, true); err != nil {
+			log.fatalErr(err)
+		}
 
-    case "goto":
+	case "goto":
 
-        gotoSet, helpPtr := newFlagSetWithHelp("goto")
+		gotoSet, helpPtr := newFlagSetWithHelp("goto")
 
-        if err := gotoSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
-        handleSubCmdHelp(*helpPtr, gotoUsage, gotoSet)
+		if err := gotoSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+		handleSubCmdHelp(*helpPtr, gotoUsage, gotoSet)
 
-        if gotoSet.NArg() == 0 {
-            log.fatal("error: please specify version argument V")
-        }
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-        v, err := strconv.ParseUint(gotoSet.Arg(0), 10, 64)
-        if err != nil {
-            log.fatal("error: can't read version argument V")
-        }
-        handleDirty := viper.GetBool("dirty")
-        destPath := viper.GetString("intermediate-path")
-        srcPath := ""
-        // if sourcePtr is set, use it to get the source path
-        // otherwise, use the path flag
-        if path != "" {
-            srcPath = path
-        }
-        if sourcePtr != "" {
-            // parse the source path from the source argument
-            parse, err := url.Parse(sourcePtr)
-            if err != nil {
-                log.fatal("error: can't parse the source path from the source argument")
-            }
-            srcPath = parse.Path
-        }
+		if gotoSet.NArg() == 0 {
+			log.fatal("error: please specify version argument V")
+		}
 
-        if handleDirty && destPath == "" {
-            log.fatal("error: intermediate-path must be specified when dirty is set")
-        }
-        log.Printf("running goto with handleDirty: %t, destPath: %s, srcPath: %s\n", handleDirty, destPath, srcPath)
-        migrater.WithDirtyStateHandler(srcPath, destPath, handleDirty)
-        if err = gotoCmd(migrater, uint(v)); err != nil {
-            log.fatalErr(err)
-        }
+		v, err := strconv.ParseUint(gotoSet.Arg(0), 10, 64)
+		if err != nil {
+			log.fatal("error: can't read version argument V")
+		}
+		handleDirty := viper.GetBool("dirty")
+		destPath := viper.GetString("intermediate-path")
+		srcPath := ""
+		// if sourcePtr is set, use it to get the source path
+		// otherwise, use the path flag
+		if path != "" {
+			srcPath = path
+		}
+		if sourcePtr != "" {
+			// parse the source path from the source argument
+			parse, err := url.Parse(sourcePtr)
+			if err != nil {
+				log.fatal("error: can't parse the source path from the source argument")
+			}
+			srcPath = parse.Path
+		}
 
-        if log.verbose {
-            log.Println("Finished after", time.Since(startTime))
-        }
+		if handleDirty && destPath == "" {
+			log.fatal("error: intermediate-path must be specified when dirty is set")
+		}
 
-    case "up":
-        upSet, helpPtr := newFlagSetWithHelp("up")
+		migrater.WithDirtyStateHandler(srcPath, destPath, handleDirty)
+		if err = gotoCmd(migrater, uint(v)); err != nil {
+			log.fatalErr(err)
+		}
 
-        if err := upSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
 
-        handleSubCmdHelp(*helpPtr, upUsage, upSet)
+	case "up":
+		upSet, helpPtr := newFlagSetWithHelp("up")
 
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+		if err := upSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        limit := -1
-        if upSet.NArg() > 0 {
-            n, err := strconv.ParseUint(upSet.Arg(0), 10, 64)
-            if err != nil {
-                log.fatal("error: can't read limit argument N")
-            }
-            limit = int(n)
-        }
+		handleSubCmdHelp(*helpPtr, upUsage, upSet)
 
-        if err := upCmd(migrater, limit); err != nil {
-            log.fatalErr(err)
-        }
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-        if log.verbose {
-            log.Println("Finished after", time.Since(startTime))
-        }
+		limit := -1
+		if upSet.NArg() > 0 {
+			n, err := strconv.ParseUint(upSet.Arg(0), 10, 64)
+			if err != nil {
+				log.fatal("error: can't read limit argument N")
+			}
+			limit = int(n)
+		}
 
-    case "down":
-        downFlagSet, helpPtr := newFlagSetWithHelp("down")
-        applyAll := downFlagSet.Bool("all", false, "Apply all down migrations")
-        if err := downFlagSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
+		if err := upCmd(migrater, limit); err != nil {
+			log.fatalErr(err)
+		}
 
-        handleSubCmdHelp(*helpPtr, downUsage, downFlagSet)
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
 
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+	case "down":
+		downFlagSet, helpPtr := newFlagSetWithHelp("down")
+		applyAll := downFlagSet.Bool("all", false, "Apply all down migrations")
 
-        downArgs := downFlagSet.Args()
+		if err := downFlagSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        log.Println(*applyAll, downArgs)
+		handleSubCmdHelp(*helpPtr, downUsage, downFlagSet)
 
-        num, needsConfirm, err := numDownMigrationsFromArgs(*applyAll, downArgs)
-        if err != nil {
-            log.fatalErr(err)
-        }
-        if needsConfirm {
-            log.Println("Are you sure you want to apply all down migrations? [y/N]")
-            var response string
-            _, _ = fmt.Scanln(&response)
-            response = strings.ToLower(strings.TrimSpace(response))
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-            if response == "y" {
-                log.Println("Applying all down migrations")
-            } else {
-                log.fatal("Not applying all down migrations")
-            }
-        }
+		downArgs := downFlagSet.Args()
+		num, needsConfirm, err := numDownMigrationsFromArgs(*applyAll, downArgs)
+		if err != nil {
+			log.fatalErr(err)
+		}
+		if needsConfirm {
+			log.Println("Are you sure you want to apply all down migrations? [y/N]")
+			var response string
+			_, _ = fmt.Scanln(&response)
+			response = strings.ToLower(strings.TrimSpace(response))
 
-        if err := downCmd(migrater, num); err != nil {
-            log.fatalErr(err)
-        }
+			if response == "y" {
+				log.Println("Applying all down migrations")
+			} else {
+				log.fatal("Not applying all down migrations")
+			}
+		}
 
-        if log.verbose {
-            log.Println("Finished after", time.Since(startTime))
-        }
+		if err := downCmd(migrater, num); err != nil {
+			log.fatalErr(err)
+		}
 
-    case "drop":
-        dropFlagSet, help := newFlagSetWithHelp("drop")
-        forceDrop := dropFlagSet.Bool("f", false, "Force the drop command by bypassing the confirmation prompt")
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
 
-        if err := dropFlagSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
+	case "drop":
+		dropFlagSet, help := newFlagSetWithHelp("drop")
+		forceDrop := dropFlagSet.Bool("f", false, "Force the drop command by bypassing the confirmation prompt")
 
-        handleSubCmdHelp(*help, dropUsage, dropFlagSet)
+		if err := dropFlagSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        if !*forceDrop {
-            log.Println("Are you sure you want to drop the entire database schema? [y/N]")
-            var response string
-            _, _ = fmt.Scanln(&response)
-            response = strings.ToLower(strings.TrimSpace(response))
+		handleSubCmdHelp(*help, dropUsage, dropFlagSet)
 
-            if response == "y" {
-                log.Println("Dropping the entire database schema")
-            } else {
-                log.fatal("Aborted dropping the entire database schema")
-            }
-        }
+		if !*forceDrop {
+			log.Println("Are you sure you want to drop the entire database schema? [y/N]")
+			var response string
+			_, _ = fmt.Scanln(&response)
+			response = strings.ToLower(strings.TrimSpace(response))
 
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+			if response == "y" {
+				log.Println("Dropping the entire database schema")
+			} else {
+				log.fatal("Aborted dropping the entire database schema")
+			}
+		}
 
-        if err := dropCmd(migrater); err != nil {
-            log.fatalErr(err)
-        }
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-        if log.verbose {
-            log.Println("Finished after", time.Since(startTime))
-        }
+		if err := dropCmd(migrater); err != nil {
+			log.fatalErr(err)
+		}
 
-    case "force":
-        forceSet, helpPtr := newFlagSetWithHelp("force")
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
 
-        if err := forceSet.Parse(args); err != nil {
-            log.fatalErr(err)
-        }
+	case "force":
+		forceSet, helpPtr := newFlagSetWithHelp("force")
 
-        handleSubCmdHelp(*helpPtr, forceUsage, forceSet)
+		if err := forceSet.Parse(args); err != nil {
+			log.fatalErr(err)
+		}
 
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+		handleSubCmdHelp(*helpPtr, forceUsage, forceSet)
 
-        if forceSet.NArg() == 0 {
-            log.fatal("error: please specify version argument V")
-        }
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-        v, err := strconv.ParseInt(forceSet.Arg(0), 10, 64)
-        if err != nil {
-            log.fatal("error: can't read version argument V")
-        }
+		if forceSet.NArg() == 0 {
+			log.fatal("error: please specify version argument V")
+		}
 
-        if v < -1 {
-            log.fatal("error: argument V must be >= -1")
-        }
+		v, err := strconv.ParseInt(forceSet.Arg(0), 10, 64)
+		if err != nil {
+			log.fatal("error: can't read version argument V")
+		}
 
-        if err := forceCmd(migrater, int(v)); err != nil {
-            log.fatalErr(err)
-        }
+		if v < -1 {
+			log.fatal("error: argument V must be >= -1")
+		}
 
-        if log.verbose {
-            log.Println("Finished after", time.Since(startTime))
-        }
+		if err := forceCmd(migrater, int(v)); err != nil {
+			log.fatalErr(err)
+		}
 
-    case "version":
-        if migraterErr != nil {
-            log.fatalErr(migraterErr)
-        }
+		if log.verbose {
+			log.Println("Finished after", time.Since(startTime))
+		}
 
-        if err := versionCmd(migrater); err != nil {
-            log.fatalErr(err)
-        }
+	case "version":
+		if migraterErr != nil {
+			log.fatalErr(migraterErr)
+		}
 
-    default:
-        printUsageAndExit()
-    }
+		if err := versionCmd(migrater); err != nil {
+			log.fatalErr(err)
+		}
+
+	default:
+		printUsageAndExit()
+	}
 }
