@@ -1418,7 +1418,7 @@ func equalDbSeq(t *testing.T, i int, expected migrationSequence, got *dStub.Stub
 	}
 }
 
-// Setting up temp directory to be used as a PVC mount
+// Setting up temp directory to be used as the volume mount
 func setupTempDir(t *testing.T) (string, func()) {
 	tempDir, err := os.MkdirTemp("", "migrate_test")
 	if err != nil {
@@ -1432,31 +1432,14 @@ func setupTempDir(t *testing.T) (string, func()) {
 }
 
 func setupMigrateInstance(tempDir string) (*Migrate, *dStub.Stub) {
-	m, _ := New("stub://", "stub://")
-	m.ds = &dirtyStateHandler{
-		destPath: tempDir,
-		isDirty:  true,
+	scheme := "stub://"
+	m, _ := New(scheme, scheme)
+	m.dirtyStateConf = &dirtyStateHandler{
+		destScheme: scheme,
+		destPath:   tempDir,
+		enable:     true,
 	}
 	return m, m.databaseDrv.(*dStub.Stub)
-}
-
-func setupSourceStubMigrations() *source.Migrations {
-	migrations := source.NewMigrations()
-	migrations.Append(&source.Migration{Version: 1, Direction: source.Up, Identifier: "CREATE 1"})
-	migrations.Append(&source.Migration{Version: 1, Direction: source.Down, Identifier: "DROP 1"})
-	migrations.Append(&source.Migration{Version: 2, Direction: source.Up, Identifier: "CREATE 2"})
-	migrations.Append(&source.Migration{Version: 2, Direction: source.Down, Identifier: "DROP 2"})
-	migrations.Append(&source.Migration{Version: 3, Direction: source.Up, Identifier: "CREATE 3"})
-	migrations.Append(&source.Migration{Version: 3, Direction: source.Down, Identifier: "DROP 3"})
-	migrations.Append(&source.Migration{Version: 4, Direction: source.Up, Identifier: "CREATE 4"})
-	migrations.Append(&source.Migration{Version: 4, Direction: source.Down, Identifier: "DROP 4"})
-	migrations.Append(&source.Migration{Version: 5, Direction: source.Up, Identifier: "CREATE 5"})
-	migrations.Append(&source.Migration{Version: 5, Direction: source.Down, Identifier: "DROP 5"})
-	migrations.Append(&source.Migration{Version: 6, Direction: source.Up, Identifier: "CREATE 6"})
-	migrations.Append(&source.Migration{Version: 6, Direction: source.Down, Identifier: "DROP 6"})
-	migrations.Append(&source.Migration{Version: 7, Direction: source.Up, Identifier: "CREATE 7"})
-	migrations.Append(&source.Migration{Version: 7, Direction: source.Down, Identifier: "DROP 7"})
-	return migrations
 }
 
 func TestHandleDirtyState(t *testing.T) {
@@ -1464,28 +1447,28 @@ func TestHandleDirtyState(t *testing.T) {
 	defer cleanup()
 
 	m, dbDrv := setupMigrateInstance(tempDir)
-	m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
 
 	tests := []struct {
-		lastSuccessful int
-		currentVersion int
-		err            error
-		setupFailure   bool
+		lastSuccessfulVersion int
+		currentVersion        int
+		err                   error
+		setupFailure          bool
 	}{
-		{lastSuccessful: 1, currentVersion: 2, err: nil, setupFailure: false},
-		{lastSuccessful: 4, currentVersion: 5, err: nil, setupFailure: false},
-		{lastSuccessful: 3, currentVersion: 4, err: nil, setupFailure: false},
-		{lastSuccessful: -3, currentVersion: 4, err: ErrInvalidVersion, setupFailure: false},
-		{lastSuccessful: 4, currentVersion: 3, err: fmt.Errorf("open %s: no such file or directory", filepath.Join(tempDir, lastSuccessfulMigrationFile)), setupFailure: true},
+		{lastSuccessfulVersion: 1, currentVersion: 3, err: nil, setupFailure: false},
+		{lastSuccessfulVersion: 4, currentVersion: 7, err: nil, setupFailure: false},
+		{lastSuccessfulVersion: 3, currentVersion: 4, err: nil, setupFailure: false},
+		{lastSuccessfulVersion: -3, currentVersion: 4, err: ErrInvalidVersion, setupFailure: false},
+		{lastSuccessfulVersion: 4, currentVersion: 3, err: fmt.Errorf("open %s: no such file or directory", filepath.Join(tempDir, lastSuccessfulMigrationFile)), setupFailure: true},
 	}
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
 			var lastSuccessfulMigrationPath string
-			// setupFailure tests scenario where the 'lastSuccessfulMigrationFile' doesn't exist
+			// setupFailure flag helps with testing scenario where the 'lastSuccessfulMigrationFile' doesn't exist
 			if !test.setupFailure {
 				lastSuccessfulMigrationPath = filepath.Join(tempDir, lastSuccessfulMigrationFile)
-				if err := os.WriteFile(lastSuccessfulMigrationPath, []byte(strconv.Itoa(test.lastSuccessful)), 0644); err != nil {
+				if err := os.WriteFile(lastSuccessfulMigrationPath, []byte(strconv.Itoa(test.lastSuccessfulVersion)), 0644); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -1504,11 +1487,11 @@ func TestHandleDirtyState(t *testing.T) {
 			}
 
 			if !b {
-				t.Fatalf("expected false, got true")
+				t.Fatalf("expected DB to be dirty, got false")
 			}
 
 			// Handle dirty state
-			if err = m.HandleDirtyState(); err != nil {
+			if err = m.handleDirtyState(); err != nil {
 				if strings.Contains(err.Error(), test.err.Error()) {
 					t.Logf("expected error %v, got %v", test.err, err)
 					if !test.setupFailure {
@@ -1526,10 +1509,10 @@ func TestHandleDirtyState(t *testing.T) {
 				t.Fatalf("expected dirty to be false, got true")
 			}
 			// Check 2: Current version should be the last successful version
-			if dbDrv.CurrentVersion != test.lastSuccessful {
-				t.Fatalf("expected version %d, got %d", test.lastSuccessful, dbDrv.CurrentVersion)
+			if dbDrv.CurrentVersion != test.lastSuccessfulVersion {
+				t.Fatalf("expected version %d, got %d", test.lastSuccessfulVersion, dbDrv.CurrentVersion)
 			}
-			// Check 3: The lastSuccessfulMigration file shouldn't exists
+			// Check 3: The lastSuccessfulMigration file shouldn't exist
 			if _, err = os.Stat(lastSuccessfulMigrationPath); !os.IsNotExist(err) {
 				t.Fatalf("expected file to be deleted, but it still exists")
 			}
@@ -1541,55 +1524,35 @@ func TestHandleMigrationFailure(t *testing.T) {
 	tempDir, cleanup := setupTempDir(t)
 	defer cleanup()
 
-	m, dbDrv := setupMigrateInstance(tempDir)
-	m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
+	m, _ := setupMigrateInstance(tempDir)
 
 	tests := []struct {
-		curVersion    int
-		targetVersion uint
-		dirtyVersion  int
+		lastSuccessFulVersion int
 	}{
-		{curVersion: 1, targetVersion: 7, dirtyVersion: 4},
-		{curVersion: 4, targetVersion: 6, dirtyVersion: 5},
-		{curVersion: 3, targetVersion: 7, dirtyVersion: 6},
+		{lastSuccessFulVersion: 3},
+		{lastSuccessFulVersion: 4},
+		{lastSuccessFulVersion: 5},
 	}
 
 	for _, test := range tests {
 		t.Run("", func(t *testing.T) {
-			t.Cleanup(func() {
-				m.sourceDrv.(*sStub.Stub).Migrations = setupSourceStubMigrations()
-				dbDrv = m.databaseDrv.(*dStub.Stub)
-			})
-
-			// Setup: Simulate a migration failure by setting the dirty version in the DB
-			if err := dbDrv.SetVersion(test.dirtyVersion, true); err != nil {
+			if err := m.handleMigrationFailure(test.lastSuccessFulVersion); err != nil {
 				t.Fatal(err)
 			}
-
-			// Test
-			if err := m.HandleMigrationFailure(test.curVersion, test.targetVersion); err != nil {
-				t.Fatal(err)
-			}
-
-			// Check 1: Should no longer be dirty
-			if !dbDrv.IsDirty {
-				t.Fatalf("expected dirty to be true, got false")
-			}
-
-			// Check 2: last successful Migration version should be stored in a file
+			// Check 1: last successful Migration version should be stored in a file
 			lastSuccessfulMigrationPath := filepath.Join(tempDir, lastSuccessfulMigrationFile)
 			if _, err := os.Stat(lastSuccessfulMigrationPath); os.IsNotExist(err) {
 				t.Fatalf("expected file to be created, but it does not exist")
 			}
 
-			// Check 3: Check if the content of last successful migration has the correct version
+			// Check 2: Check if the content of last successful migration has the correct version
 			content, err := os.ReadFile(lastSuccessfulMigrationPath)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			if string(content) != strconv.Itoa(test.dirtyVersion-1) {
-				t.Fatalf("expected %d, got %s", test.dirtyVersion-1, string(content))
+			if string(content) != strconv.Itoa(test.lastSuccessFulVersion) {
+				t.Fatalf("expected %d, got %s", test.lastSuccessFulVersion, string(content))
 			}
 		})
 	}
@@ -1600,6 +1563,7 @@ func TestCleanupFiles(t *testing.T) {
 	defer cleanup()
 
 	m, _ := setupMigrateInstance(tempDir)
+	m.sourceDrv.(*sStub.Stub).Migrations = sourceStubMigrations
 
 	tests := []struct {
 		migrationFiles []string
@@ -1608,14 +1572,14 @@ func TestCleanupFiles(t *testing.T) {
 		emptyDestPath  bool
 	}{
 		{
-			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+			migrationFiles: []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql"},
 			targetVersion:  2,
-			remainingFiles: []string{"1_up.sql", "2_up.sql"},
+			remainingFiles: []string{"1_name.up.sql", "2_name.up.sql"},
 		},
 		{
-			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql", "5_up.sql"},
+			migrationFiles: []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql", "4_name.up.sql", "5_name.up.sql"},
 			targetVersion:  3,
-			remainingFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+			remainingFiles: []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql"},
 		},
 		{
 			migrationFiles: []string{},
@@ -1634,10 +1598,10 @@ func TestCleanupFiles(t *testing.T) {
 			}
 
 			if test.emptyDestPath {
-				m.ds.destPath = ""
+				m.dirtyStateConf.destPath = ""
 			}
 
-			if err := m.CleanupFiles(test.targetVersion); err != nil {
+			if err := m.cleanupFiles(test.targetVersion); err != nil {
 				t.Fatal(err)
 			}
 
@@ -1666,11 +1630,8 @@ func TestCopyFiles(t *testing.T) {
 	destDir, cleanupDest := setupTempDir(t)
 	defer cleanupDest()
 
-	m, _ := New("stub://", "stub://")
-	m.ds = &dirtyStateHandler{
-		srcPath:  srcDir,
-		destPath: destDir,
-	}
+	m, _ := setupMigrateInstance(destDir)
+	m.dirtyStateConf.srcPath = srcDir
 
 	tests := []struct {
 		migrationFiles []string
@@ -1678,12 +1639,12 @@ func TestCopyFiles(t *testing.T) {
 		emptyDestPath  bool
 	}{
 		{
-			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql"},
-			copiedFiles:    []string{"1_up.sql", "2_up.sql", "3_up.sql"},
+			migrationFiles: []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql"},
+			copiedFiles:    []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql"},
 		},
 		{
-			migrationFiles: []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql", "current.sql"},
-			copiedFiles:    []string{"1_up.sql", "2_up.sql", "3_up.sql", "4_up.sql"},
+			migrationFiles: []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql", "4_name.up.sql", "current.sql"},
+			copiedFiles:    []string{"1_name.up.sql", "2_name.up.sql", "3_name.up.sql", "4_name.up.sql"},
 		},
 		{
 			emptyDestPath: true,
@@ -1698,10 +1659,10 @@ func TestCopyFiles(t *testing.T) {
 				}
 			}
 			if test.emptyDestPath {
-				m.ds.destPath = ""
+				m.dirtyStateConf.destPath = ""
 			}
 
-			if err := m.CopyFiles(); err != nil {
+			if err := m.copyFiles(); err != nil {
 				t.Fatal(err)
 			}
 

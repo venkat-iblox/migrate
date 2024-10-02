@@ -37,6 +37,6 @@ var (
 	flagConfigFile      = pflag.String("config.file", "", "configuration file name without extension")
 
 	// goto command flags
-	flagDirty   = pflag.Bool("dirty", false, "migration is dirty")
-	flagPVCPath = pflag.String("intermediate-path", "", "path to the mounted volume which is used to copy the migration files")
+	flagDirty     = pflag.Bool("force-dirty-handling", false, "force the handling of dirty database state")
+	flagMountPath = pflag.String("cache-dir", "", "path to the mounted volume which is used to copy the migration files")
 )

@@ -7,7 +7,7 @@ package migrate
 import (
 	"errors"
 	"fmt"
-	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -89,13 +89,19 @@ type Migrate struct {
 	LockTimeout time.Duration
 
 	// DirtyStateHandler is used to handle dirty state of the database
-	ds *dirtyStateHandler
+	dirtyStateConf *dirtyStateHandler
 }
 
 type dirtyStateHandler struct {
-	srcPath  string
-	destPath string
-	isDirty  bool
+	srcScheme  string
+	srcPath    string
+	destScheme string
+	destPath   string
+	enable     bool
+}
+
+func (m *Migrate) IsDirtyHandlingEnabled() bool {
+	return m.dirtyStateConf != nil && m.dirtyStateConf.enable && m.dirtyStateConf.destPath != ""
 }
 
 // New returns a new Migrate instance from a source URL and a database URL.
@@ -131,6 +137,11 @@ func New(sourceURL, databaseURL string) (*Migrate, error) {
 }
 
 func (m *Migrate) updateSourceDrv(sourceURL string) error {
+	sourceName, err := iurl.SchemeFromURL(sourceURL)
+	if err != nil {
+		return fmt.Errorf("failed to parse scheme from source URL: %w", err)
+	}
+	m.sourceName = sourceName
 	sourceDrv, err := source.Open(sourceURL)
 	if err != nil {
 		return fmt.Errorf("failed to open source, %q: %w", sourceURL, err)
@@ -207,12 +218,40 @@ func NewWithInstance(sourceName string, sourceInstance source.Driver, databaseNa
 	return m, nil
 }
 
-func (m *Migrate) WithDirtyStateHandler(srcPath, destPath string, isDirty bool) {
-	m.ds = &dirtyStateHandler{
-		srcPath:  srcPath,
-		destPath: destPath,
-		isDirty:  isDirty,
+func (m *Migrate) WithDirtyStateHandler(srcPath, destPath string, isDirty bool) error {
+	parser := func(path string) (string, string, error) {
+		var scheme, p string
+		uri, err := url.Parse(path)
+		if err != nil {
+			return "", "", err
+		}
+		scheme = uri.Scheme
+		p = uri.Path
+		// if no scheme is provided, assume it's a file path
+		if scheme == "" {
+			scheme = "file://"
+		}
+		return scheme, p, nil
 	}
+
+	sScheme, sPath, err := parser(srcPath)
+	if err != nil {
+		return err
+	}
+
+	dScheme, dPath, err := parser(destPath)
+	if err != nil {
+		return err
+	}
+
+	m.dirtyStateConf = &dirtyStateHandler{
+		srcScheme:  sScheme,
+		destScheme: dScheme,
+		srcPath:    sPath,
+		destPath:   dPath,
+		enable:     isDirty,
+	}
+	return nil
 }
 
 func newCommon() *Migrate {
@@ -255,29 +294,19 @@ func (m *Migrate) Migrate(version uint) error {
 
 	// if the dirty flag is passed to the 'goto' command, handle the dirty state
 	if dirty {
-		if m.ds != nil && m.ds.isDirty {
-			if err = m.unlock(); err != nil {
+		if m.IsDirtyHandlingEnabled() {
+			if err = m.handleDirtyState(); err != nil {
 				return m.unlockErr(err)
 			}
-			if err = m.HandleDirtyState(); err != nil {
-				return m.unlockErr(err)
-			}
-			if err = m.lock(); err != nil {
-				return err
-			}
-			if err = m.updateSourceDrv("file://" + m.ds.destPath); err != nil {
-				return m.unlockErr(err)
-			}
-
 		} else {
-			// default behaviour
+			// default behavior
 			return m.unlockErr(ErrDirty{curVersion})
 		}
 	}
 
 	// Copy migrations to the destination directory,
 	// if state was dirty when Migrate was called, we should handle the dirty state first before copying the migrations
-	if err = m.CopyFiles(); err != nil {
+	if err = m.copyFiles(); err != nil {
 		return m.unlockErr(err)
 	}
 
@@ -285,16 +314,11 @@ func (m *Migrate) Migrate(version uint) error {
 	go m.read(curVersion, int(version), ret)
 
 	if err = m.runMigrations(ret); err != nil {
-		if m.ds != nil && m.ds.isDirty {
-			// Handle failure: store last successful migration version and exit
-			if err = m.HandleMigrationFailure(curVersion, version); err != nil {
-				return m.unlockErr(err)
-			}
-		}
 		return m.unlockErr(err)
 	}
 	// Success: Clean up and confirm
-	if err = m.CleanupFiles(version); err != nil {
+	// Files are cleaned up after the migration is successful
+	if err = m.cleanupFiles(version); err != nil {
 		return m.unlockErr(err)
 	}
 	// unlock the database
@@ -793,6 +817,7 @@ func (m *Migrate) readDown(from int, limit int, ret chan<- interface{}) {
 // to stop execution because it might have received a stop signal on the
 // GracefulStop channel.
 func (m *Migrate) runMigrations(ret <-chan interface{}) error {
+	var lastCleanMigrationApplied int
 	for r := range ret {
 
 		if m.stop() {
@@ -814,6 +839,15 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 			if migr.Body != nil {
 				m.logVerbosePrintf("Read and execute %v\n", migr.LogString())
 				if err := m.databaseDrv.Run(migr.BufferedBody); err != nil {
+					if m.dirtyStateConf != nil && m.dirtyStateConf.enable {
+						// this condition is required if the first migration fails
+						if lastCleanMigrationApplied == 0 {
+							lastCleanMigrationApplied = migr.TargetVersion
+						}
+						if e := m.handleMigrationFailure(lastCleanMigrationApplied); e != nil {
+							return multierror.Append(err, e)
+						}
+					}
 					return err
 				}
 			}
@@ -822,7 +856,7 @@ func (m *Migrate) runMigrations(ret <-chan interface{}) error {
 			if err := m.databaseDrv.SetVersion(migr.TargetVersion, false); err != nil {
 				return err
 			}
-
+			lastCleanMigrationApplied = migr.TargetVersion
 			endTime := time.Now()
 			readTime := migr.FinishedReading.Sub(migr.StartedBuffering)
 			runTime := endTime.Sub(migr.FinishedReading)
@@ -1050,9 +1084,20 @@ func (m *Migrate) logErr(err error) {
 	}
 }
 
-func (m *Migrate) HandleDirtyState() error {
-	// Perform actions when the database state is dirty
-	lastSuccessfulMigrationPath := filepath.Join(m.ds.destPath, lastSuccessfulMigrationFile)
+func (m *Migrate) handleDirtyState() error {
+	// Perform the following actions when the database state is dirty
+	/*
+	   1. Update the source driver to read the migrations from the mounted volume
+	   2. Read the last successful migration version from the file
+	   3. Set the last successful migration version in the schema_migrations table
+	   4. Delete the last successful migration file
+	*/
+	// the source driver should read the migrations from the mounted volume
+	// as the DB is dirty and last applied migrations to the database are not present in the source path
+	if err := m.updateSourceDrv(m.dirtyStateConf.destScheme + m.dirtyStateConf.destPath); err != nil {
+		return err
+	}
+	lastSuccessfulMigrationPath := filepath.Join(m.dirtyStateConf.destPath, lastSuccessfulMigrationFile)
 	lastVersionBytes, err := os.ReadFile(lastSuccessfulMigrationPath)
 	if err != nil {
 		return err
@@ -1063,11 +1108,12 @@ func (m *Migrate) HandleDirtyState() error {
 		return fmt.Errorf("failed to parse last successful migration version: %w", err)
 	}
 
-	if err = m.Force(int(lastVersion)); err != nil {
+	// Set the last successful migration version in the schema_migrations table
+	if err = m.databaseDrv.SetVersion(int(lastVersion), false); err != nil {
 		return fmt.Errorf("failed to apply last successful migration: %w", err)
 	}
 
-	m.logPrintf("Successfully applied migration: %s", lastVersionStr)
+	m.logPrintf("Successfully set last successful migration version: %s on the DB", lastVersionStr)
 
 	if err = os.Remove(lastSuccessfulMigrationPath); err != nil {
 		return err
@@ -1077,134 +1123,74 @@ func (m *Migrate) HandleDirtyState() error {
 	return nil
 }
 
-func (m *Migrate) HandleMigrationFailure(curVersion int, v uint) error {
-	failedVersion, _, err := m.databaseDrv.Version()
-	if err != nil {
-		return err
-	}
-	// Determine the last successful migration
-	lastSuccessfulMigration := strconv.Itoa(curVersion)
-	ret := make(chan interface{}, m.PrefetchMigrations)
-	go m.read(curVersion, int(v), ret)
-
-	for r := range ret {
-		mig, ok := r.(*Migration)
-		if ok {
-			if mig.Version == uint(failedVersion) {
-				break
-			}
-			lastSuccessfulMigration = strconv.Itoa(int(mig.Version))
-		}
-	}
-
-	lastSuccessfulMigrationPath := filepath.Join(m.ds.destPath, lastSuccessfulMigrationFile)
-	return os.WriteFile(lastSuccessfulMigrationPath, []byte(lastSuccessfulMigration), 0644)
-}
-
-func (m *Migrate) CleanupFiles(v uint) error {
-	if m.ds == nil || m.ds.destPath == "" {
+func (m *Migrate) handleMigrationFailure(lastSuccessfulMigration int) error {
+	if !m.IsDirtyHandlingEnabled() {
 		return nil
 	}
-	files, err := os.ReadDir(m.ds.destPath)
-	if err != nil {
-		return err
+	lastSuccessfulMigrationPath := filepath.Join(m.dirtyStateConf.destPath, lastSuccessfulMigrationFile)
+	return os.WriteFile(lastSuccessfulMigrationPath, []byte(strconv.Itoa(lastSuccessfulMigration)), 0644)
+}
+
+func (m *Migrate) cleanupFiles(targetVersion uint) error {
+	if !m.IsDirtyHandlingEnabled() {
+		return nil
 	}
 
-	targetVersion := uint64(v)
+	files, err := os.ReadDir(m.dirtyStateConf.destPath)
+	if err != nil {
+		// If the directory does not exist
+		return fmt.Errorf("failed to read directory %s: %w", m.dirtyStateConf.destPath, err)
+	}
 
 	for _, file := range files {
 		fileName := file.Name()
-
-		// Check if file is a migration file we want to process
-		if !strings.HasSuffix(fileName, "down.sql") && !strings.HasSuffix(fileName, "up.sql") {
-			continue
-		}
-
-		// Extract version and compare
-		versionEnd := strings.Index(fileName, "_")
-		if versionEnd == -1 {
-			// Skip files that don't match the expected naming pattern
-			continue
-		}
-
-		fileVersion, err := strconv.ParseUint(fileName[:versionEnd], 10, 64)
+		migration, err := source.Parse(fileName)
 		if err != nil {
-			m.logErr(fmt.Errorf("skipping file %s due to version parse error: %v", fileName, err))
-			continue
+			return err
 		}
-
 		// Delete file if version is greater than targetVersion
-		if fileVersion > targetVersion {
-			if err = os.Remove(filepath.Join(m.ds.destPath, fileName)); err != nil {
+		if migration.Version > targetVersion {
+			if err = os.Remove(filepath.Join(m.dirtyStateConf.destPath, fileName)); err != nil {
 				m.logErr(fmt.Errorf("failed to delete file %s: %v", fileName, err))
 				continue
 			}
-			m.logPrintf("Deleted file: %s", fileName)
+			m.logPrintf("Migration file: %s removed during cleanup", fileName)
 		}
 	}
 
 	return nil
 }
 
-// CopyFiles copies all files from srcDir to destDir.
-func (m *Migrate) CopyFiles() error {
-	if m.ds == nil || m.ds.destPath == "" {
+// copyFiles copies all files from source to destination volume.
+func (m *Migrate) copyFiles() error {
+	// this is the case when the dirty handling is disabled
+	if !m.IsDirtyHandlingEnabled() {
 		return nil
 	}
-	_, err := os.ReadDir(m.ds.destPath)
+
+	files, err := os.ReadDir(m.dirtyStateConf.srcPath)
 	if err != nil {
 		// If the directory does not exist
-		return err
+		return fmt.Errorf("failed to read directory %s: %w", m.dirtyStateConf.srcPath, err)
+	}
+	m.logPrintf("Copying files from %s to %s", m.dirtyStateConf.srcPath, m.dirtyStateConf.destPath)
+	for _, file := range files {
+		fileName := file.Name()
+		if source.Regex.MatchString(fileName) {
+			fileContentBytes, err := os.ReadFile(filepath.Join(m.dirtyStateConf.srcPath, fileName))
+			if err != nil {
+				return err
+			}
+			info, err := file.Info()
+			if err != nil {
+				return err
+			}
+			if err = os.WriteFile(filepath.Join(m.dirtyStateConf.destPath, fileName), fileContentBytes, info.Mode().Perm()); err != nil {
+				return err
+			}
+		}
 	}
 
-	m.logPrintf("Copying files from %s to %s", m.ds.srcPath, m.ds.destPath)
-
-	return filepath.Walk(m.ds.srcPath, func(src string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// ignore sub-directories in the migration directory
-		if info.IsDir() {
-			// Skip the tests directory and its files
-			if info.Name() == "tests" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		// Ignore the current.sql file
-		if info.Name() == "current.sql" {
-			return nil
-		}
-
-		var (
-			srcFile  *os.File
-			destFile *os.File
-		)
-		dest := filepath.Join(m.ds.destPath, info.Name())
-		if srcFile, err = os.Open(src); err != nil {
-			return err
-		}
-		defer func(srcFile *os.File) {
-			if err = srcFile.Close(); err != nil {
-				m.logErr(fmt.Errorf("failed to close file %s: %v", destFile.Name(), err))
-			}
-		}(srcFile)
-
-		// Create the destination file
-		if destFile, err = os.Create(dest); err != nil {
-			return err
-		}
-		defer func(destFile *os.File) {
-			if err = destFile.Close(); err != nil {
-				m.logErr(fmt.Errorf("failed to close file %s: %v", destFile.Name(), err))
-			}
-		}(destFile)
-
-		// Copy the file
-		if _, err = io.Copy(destFile, srcFile); err != nil {
-			return err
-		}
-		return os.Chmod(dest, info.Mode())
-	})
+	m.logPrintf("Successfully Copied files from %s to %s", m.dirtyStateConf.srcPath, m.dirtyStateConf.destPath)
+	return nil
 }
