@@ -1420,12 +1420,10 @@ func equalDbSeq(t *testing.T, i int, expected migrationSequence, got *dStub.Stub
 
 // Setting up temp directory to be used as the volume mount
 func setupTempDir(t *testing.T) (string, func()) {
-	tempDir, err := os.MkdirTemp("", "migrate_test")
-	if err != nil {
-		t.Fatal(err)
-	}
+	tempDir := t.TempDir()
+
 	return tempDir, func() {
-		if err = os.RemoveAll(tempDir); err != nil {
+		if err := os.RemoveAll(tempDir); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1434,7 +1432,7 @@ func setupTempDir(t *testing.T) (string, func()) {
 func setupMigrateInstance(tempDir string) (*Migrate, *dStub.Stub) {
 	scheme := "stub://"
 	m, _ := New(scheme, scheme)
-	m.dirtyStateConf = &dirtyStateHandler{
+	m.dirtyStateConf = &dirtyStateConfig{
 		destScheme: scheme,
 		destPath:   tempDir,
 		enable:     true,
